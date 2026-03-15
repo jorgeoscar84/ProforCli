@@ -1,0 +1,162 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - role: string (required, 'admin' or 'distributor')
+    //   - email: string (required)
+    //   - profile: map (optional, contains companyName, ruc, etc.)
+    //
+    // Collection: products
+    // Document ID: {productId}
+    // Fields:
+    //   - name: string (required)
+    //   - description: string (optional)
+    //   - basePrice: number (required)
+    //
+    // Collection: settings
+    // Document ID: admin
+    // Fields:
+    //   - aiContext: string (required)
+    //   - ivaPercentage: number (required)
+    //   - defaultLogoUrl: string (optional)
+    //   - primaryColor: string (optional)
+    //
+    // Collection: proformas
+    // Document ID: {proformaId}
+    // Fields:
+    //   - ownerId: string (required)
+    //   - date: string (required)
+    //   - distributor: map (required)
+    //   - client: map (required)
+    //   - items: list (required)
+    //   - subtotal: number (required)
+    //   - iva: number (required)
+    //   - total: number (required)
+    //   - aiCopy: string (optional)
+    //   - notes: string (optional)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+        request.auth.token.email == "jorgeoscar84@gmail.com"
+      );
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.ownerId;
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function hasOnlyAllowedFields(allowedFields) {
+      return request.resource.data.keys().hasOnly(allowedFields);
+    }
+
+    function hasRequiredFields(requiredFields) {
+      return request.resource.data.keys().hasAll(requiredFields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasOnly(['role', 'email', 'profile']) &&
+             data.keys().hasAll(['role', 'email']) &&
+             data.role in ['admin', 'distributor'] &&
+             isValidEmail(data.email) &&
+             (!('profile' in data) || data.profile is map);
+    }
+
+    function isValidProduct(data) {
+      return data.keys().hasOnly(['name', 'description', 'basePrice']) &&
+             data.keys().hasAll(['name', 'basePrice']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             (!('description' in data) || (data.description is string && data.description.size() < 1000)) &&
+             data.basePrice is number && data.basePrice >= 0;
+    }
+
+    function isValidSettings(data) {
+      return data.keys().hasOnly(['aiContext', 'ivaPercentage', 'defaultLogoUrl', 'primaryColor']) &&
+             data.keys().hasAll(['aiContext', 'ivaPercentage']) &&
+             data.aiContext is string && data.aiContext.size() < 5000 &&
+             data.ivaPercentage is number && data.ivaPercentage >= 0 && data.ivaPercentage <= 100 &&
+             (!('defaultLogoUrl' in data) || (data.defaultLogoUrl is string && data.defaultLogoUrl.size() < 1048576)) &&
+             (!('primaryColor' in data) || (data.primaryColor is string && data.primaryColor.size() < 20));
+    }
+
+    function isValidProforma(data) {
+      return data.keys().hasOnly(['ownerId', 'date', 'distributor', 'client', 'items', 'subtotal', 'iva', 'total', 'aiCopy', 'notes']) &&
+             data.keys().hasAll(['ownerId', 'date', 'distributor', 'client', 'items', 'subtotal', 'iva', 'total']) &&
+             data.ownerId is string && data.ownerId.size() > 0 &&
+             data.date is string && data.date.size() > 0 && data.date.size() < 50 &&
+             data.distributor is map &&
+             data.client is map &&
+             data.items is list && data.items.size() <= 100 &&
+             data.subtotal is number && data.subtotal >= 0 &&
+             data.iva is number && data.iva >= 0 &&
+             data.total is number && data.total >= 0 &&
+             (!('aiCopy' in data) || (data.aiCopy is string && data.aiCopy.size() < 5000)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() < 5000));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      // Users can create their own profile, but only as a distributor unless they are already an admin
+      allow create: if isAuthenticated() && isValidUser(request.resource.data) && (
+        (isOwner(userId) && request.resource.data.role == 'distributor') || isAdmin()
+      );
+      // Users can update their own profile, but cannot change their role
+      allow update: if isAuthenticated() && isValidUser(request.resource.data) && (
+        (isOwner(userId) && request.resource.data.role == resource.data.role) || isAdmin()
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /products/{productId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAdmin() && isValidProduct(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /settings/admin {
+      allow read: if isAuthenticated();
+      allow create, update: if isAdmin() && isValidSettings(request.resource.data);
+      allow delete: if false; // Settings should not be deleted
+    }
+
+    match /proformas/{proformaId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && isValidProforma(request.resource.data) && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isAuthenticated() && isValidProforma(request.resource.data) && isDocOwner() && request.resource.data.ownerId == resource.data.ownerId;
+      allow delete: if isDocOwner() || isAdmin();
+    }
+  }
+}
